@@ -5,12 +5,12 @@ This repository showcases the hardware engineering work for the MDP project at N
 * Precise control of robot movement using PID controllers
 * Turning and movement commands through UART communication
 * Support for different movement directions:
- * Forward
- * Backward
- * Forward Left
- * Forward Right
- * Backward Left
- * Backward Right
+  * Forward
+  * Backward
+  * Forward Left
+  * Forward Right
+  * Backward Left
+  * Backward Right
 *  Center calibration and open-loop movement support
 * Gyroscope integration for accurate angle measurements
 * Raspberry Pi integration for camera and ultrasonic sensor support
@@ -22,6 +22,8 @@ STM32:
 chassisTask(void *argument): Main control task for the robot's movement. It reads commands from a message queue, decodes the commands, and controls the motors and servos accordingly.
  * HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart): UART receive complete callback function, triggered when a command is received through UART. It processes the received command and puts it into the message queue for the chassisTask function to handle.
 and other helper functions.
+
+
 Raspberry Pi:
  * capture_and_send(): Captures an image using the PiCamera and sends it to a computer vision server for processing.
  * get_distance(): Measures the distance between the robot and an obstacle using an ultrasonic sensor.
