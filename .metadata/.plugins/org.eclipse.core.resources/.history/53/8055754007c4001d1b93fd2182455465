@@ -1,0 +1,1215 @@
+/* USER CODE BEGIN Header */
+/**
+ ******************************************************************************
+ * @file           : main.c
+ * @brief          : Main program body
+ ******************************************************************************
+ * @attention
+ *
+ * Copyright (c) 2023 STMicroelectronics.
+ * All rights reserved.
+ *
+ * This software is licensed under terms that can be found in the LICENSE file
+ * in the root directory of this software component.
+ * If no LICENSE file comes with this software, it is provided AS-IS.
+ *
+ ******************************************************************************
+ */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "oled.h"
+#include "string.h"
+#include "pid.h"
+#include "ICM20948.h"
+#include "stdio.h"
+#include "stdlib.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define ALPHA 0.8
+#define REAR_WHEEL_RADIUS_CM 3.3
+#define REAR_WHEEL_ROTATION_DISTANCE (2 * 3.142 * REAR_WHEEL_RADIUS_CM)
+#define ENCODER_PULSES_PER_ROTATION 1560
+#define DISTANCE_PER_ENCODER_PULSE (REAR_WHEEL_ROTATION_DISTANCE / ENCODER_PULSES_PER_ROTATION)
+
+////////// Steering Wheels ////////////////
+
+#define CENTER_POS_PWM 153 //150
+#define LEFT_DELTA 23  // was 40
+#define RIGHT_DELTA 70 // was 80 then 100
+#define LEFT_ADJUST_DELTA 10
+#define RIGHT_ADJUST_DELTA 20
+#define STEERING_BUFFER_TIME 250
+#define LEFT_POS_PWM (CENTER_POS_PWM - LEFT_DELTA)
+#define RIGHT_POS_PWM (CENTER_POS_PWM + RIGHT_DELTA)
+#define LEFT_ADJUST_PWM (CENTER_POS_PWM - LEFT_ADJUST_DELTA)
+#define RIGHT_ADJUST_PWM (CENTER_POS_PWM + RIGHT_ADJUST_DELTA)
+
+///////////// MOVEMENT COMMANDS ////////////
+#define MOVE_FORWARD 1
+#define MOVE_BACKWARD 2
+#define MOVE_FORWARD_LEFT 3
+#define MOVE_BACKWARD_LEFT 4
+#define MOVE_FORWARD_RIGHT 5
+#define MOVE_BACKWARD_RIGHT 6
+#define CENTER_CALIBRATION 7
+#define MOVE_INFINITELY 8
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+void setMotorForward();
+void setMotorBackward();
+void moveMotor(int);
+void motorStop();
+void turnLeft();
+void turnRight();
+void faceFront();
+uint32_t getEncoderDelta(uint32_t count1, uint32_t count2,
+		TIM_HandleTypeDef *hal_tim);
+void commandToEncoderCounts(int directionCmd, int distanceCmd);
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
+TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
+TIM_HandleTypeDef htim3;
+TIM_HandleTypeDef htim8;
+
+UART_HandleTypeDef huart3;
+
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = { .name = "defaultTask",
+		.stack_size = 128 * 4, .priority = (osPriority_t) osPriorityNormal, };
+/* Definitions for ChassisTask */
+osThreadId_t ChassisTaskHandle;
+const osThreadAttr_t ChassisTask_attributes = { .name = "ChassisTask",
+		.stack_size = 512 * 4, .priority = (osPriority_t) osPriorityNormal, };
+/* Definitions for chassisCommandQueue */
+osMessageQueueId_t chassisCommandQueueHandle;
+const osMessageQueueAttr_t chassisCommandQueue_attributes = { .name =
+		"chassisCommandQueue" };
+/* USER CODE BEGIN PV */
+
+///////////// TRANSMISSION AND COMMAND PROCESSING /////////////
+uint8_t aRxBuffer[5]; // buffer for UART
+uint8_t newCmdReceived;
+uint8_t directionCmd;
+uint8_t steeringCmd;
+uint32_t data = 0;
+uint8_t cmdFinishFlag;
+////////////////////////////////////////
+
+///////////// GYRO STEERING /////////////
+float targetAngle = 0;
+float angleNow = 0;
+uint8_t readGyroZData[2];
+int16_t gyroZ;
+uint32_t last_curTask_tick = 0;
+
+///////////// PID CONTROLLER /////////////
+fp32 pid_param_right[3] = { 3.1, 0.0, 0.1 };
+fp32 pid_param_turn[3] = { 10, 0.15, 0.3 }; // used for PID steering (not as accurate as Gyro but quicker)
+fp32 max_out = 4000;
+fp32 max_out_turn = 5000;
+fp32 max_iout = 3000;
+volatile double setpoint_left = 0;
+volatile double output_left = 0;
+volatile double input_left = 0;
+volatile double setpoint_right = 0;
+volatile double output_right = 0;
+volatile double input_right = 0;
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_TIM8_Init(void);
+static void MX_TIM1_Init(void);
+static void MX_TIM2_Init(void);
+static void MX_TIM3_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_I2C1_Init(void);
+void StartDefaultTask(void *argument);
+void chassisTask(void *argument);
+
+/* USER CODE BEGIN PFP */
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+////////////////////////////////////
+// Create PID controllers
+pid_type_def left_pid, right_pid;
+pid_type_def left_turn_pid, right_turn_pid;
+
+/* USER CODE END 0 */
+
+/**
+ * @brief  The application entry point.
+ * @retval int
+ */
+int main(void) {
+	/* USER CODE BEGIN 1 */
+
+	/* USER CODE END 1 */
+
+	/* MCU Configuration--------------------------------------------------------*/
+
+	/* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+	HAL_Init();
+
+	/* USER CODE BEGIN Init */
+	OLED_Init();
+	PID_init(&left_pid, PID_POSITION, pid_param_right, max_out, max_iout);
+	PID_init(&right_pid, PID_POSITION, pid_param_right, max_out, max_iout);
+
+	PID_init(&left_turn_pid, PID_POSITION, pid_param_turn, max_out_turn,
+			max_iout);
+	PID_init(&right_turn_pid, PID_POSITION, pid_param_turn, max_out_turn,
+			max_iout);
+
+	ICM20948_init(&hi2c1, 0, GYRO_FULL_SCALE_2000DPS);
+	/* USER CODE END Init */
+
+	/* Configure the system clock */
+	SystemClock_Config();
+
+	/* USER CODE BEGIN SysInit */
+
+	/* USER CODE END SysInit */
+
+	/* Initialize all configured peripherals */
+	MX_GPIO_Init();
+	MX_TIM8_Init();
+	MX_TIM1_Init();
+	MX_TIM2_Init();
+	MX_TIM3_Init();
+	MX_USART3_UART_Init();
+	MX_I2C1_Init();
+	/* USER CODE BEGIN 2 */
+	OLED_Init();
+	HAL_UART_Receive_IT(&huart3, (uint8_t*) aRxBuffer, 10);
+
+	//start pwm
+	//servo
+	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+
+	// Left Motor Encoder
+	HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+	// Right Motor Encoder
+	HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
+
+	// Set up the Motors PWM
+	HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+	HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+
+	/* USER CODE END 2 */
+
+	/* Init scheduler */
+	osKernelInitialize();
+
+	/* USER CODE BEGIN RTOS_MUTEX */
+	/* add mutexes, ... */
+	/* USER CODE END RTOS_MUTEX */
+
+	/* USER CODE BEGIN RTOS_SEMAPHORES */
+	/* add semaphores, ... */
+	/* USER CODE END RTOS_SEMAPHORES */
+
+	/* USER CODE BEGIN RTOS_TIMERS */
+	/* start timers, add new ones, ... */
+	/* USER CODE END RTOS_TIMERS */
+
+	/* Create the queue(s) */
+	/* creation of chassisCommandQueue */
+	chassisCommandQueueHandle = osMessageQueueNew(100, sizeof(uint32_t),
+			&chassisCommandQueue_attributes);
+
+	/* USER CODE BEGIN RTOS_QUEUES */
+	/* add queues, ... */
+	/* USER CODE END RTOS_QUEUES */
+
+	/* Create the thread(s) */
+	/* creation of defaultTask */
+	defaultTaskHandle = osThreadNew(StartDefaultTask, NULL,
+			&defaultTask_attributes);
+
+	/* creation of ChassisTask */
+	ChassisTaskHandle = osThreadNew(chassisTask, NULL, &ChassisTask_attributes);
+
+	/* USER CODE BEGIN RTOS_THREADS */
+	/* add threads, ... */
+	/* USER CODE END RTOS_THREADS */
+
+	/* USER CODE BEGIN RTOS_EVENTS */
+	/* add events, ... */
+	/* USER CODE END RTOS_EVENTS */
+
+	/* Start scheduler */
+	osKernelStart();
+
+	/* We should never get here as control is now taken by the scheduler */
+	/* Infinite loop */
+	/* USER CODE BEGIN WHILE */
+	while (1) {
+		/* USER CODE END WHILE */
+
+		/* USER CODE BEGIN 3 */
+	}
+	/* USER CODE END 3 */
+}
+
+/**
+ * @brief System Clock Configuration
+ * @retval None
+ */
+void SystemClock_Config(void) {
+	RCC_OscInitTypeDef RCC_OscInitStruct = { 0 };
+	RCC_ClkInitTypeDef RCC_ClkInitStruct = { 0 };
+
+	/** Configure the main internal regulator output voltage
+	 */
+	__HAL_RCC_PWR_CLK_ENABLE();
+	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+	/** Initializes the RCC Oscillators according to the specified parameters
+	 * in the RCC_OscInitTypeDef structure.
+	 */
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+	RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+	RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+	if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+		Error_Handler();
+	}
+
+	/** Initializes the CPU, AHB and APB buses clocks
+	 */
+	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+			| RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
+	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+	if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK) {
+		Error_Handler();
+	}
+}
+
+/**
+ * @brief I2C1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_I2C1_Init(void) {
+
+	/* USER CODE BEGIN I2C1_Init 0 */
+
+	/* USER CODE END I2C1_Init 0 */
+
+	/* USER CODE BEGIN I2C1_Init 1 */
+
+	/* USER CODE END I2C1_Init 1 */
+	hi2c1.Instance = I2C1;
+	hi2c1.Init.ClockSpeed = 100000;
+	hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+	hi2c1.Init.OwnAddress1 = 0;
+	hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+	hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+	hi2c1.Init.OwnAddress2 = 0;
+	hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+	hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+	if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN I2C1_Init 2 */
+
+	/* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+ * @brief TIM1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM1_Init(void) {
+
+	/* USER CODE BEGIN TIM1_Init 0 */
+
+	/* USER CODE END TIM1_Init 0 */
+
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+	TIM_OC_InitTypeDef sConfigOC = { 0 };
+	TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = { 0 };
+
+	/* USER CODE BEGIN TIM1_Init 1 */
+
+	/* USER CODE END TIM1_Init 1 */
+	htim1.Instance = TIM1;
+	htim1.Init.Prescaler = 160;
+	htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim1.Init.Period = 1000;
+	htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim1.Init.RepetitionCounter = 0;
+	htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+	if (HAL_TIM_Base_Init(&htim1) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim1, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_TIM_PWM_Init(&htim1) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	sConfigOC.OCMode = TIM_OCMODE_PWM1;
+	sConfigOC.Pulse = 0;
+	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+	sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+	sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+	if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+	sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+	sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+	sBreakDeadTimeConfig.DeadTime = 0;
+	sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+	sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+	sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+	if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM1_Init 2 */
+
+	/* USER CODE END TIM1_Init 2 */
+	HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+ * @brief TIM2 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM2_Init(void) {
+
+	/* USER CODE BEGIN TIM2_Init 0 */
+
+	/* USER CODE END TIM2_Init 0 */
+
+	TIM_Encoder_InitTypeDef sConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+
+	/* USER CODE BEGIN TIM2_Init 1 */
+
+	/* USER CODE END TIM2_Init 1 */
+	htim2.Instance = TIM2;
+	htim2.Init.Prescaler = 0;
+	htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim2.Init.Period = 65535;
+	htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+	sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+	sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+	sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+	sConfig.IC1Filter = 10;
+	sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+	sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+	sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+	sConfig.IC2Filter = 0;
+	if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM2_Init 2 */
+
+	/* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
+ * @brief TIM3 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM3_Init(void) {
+
+	/* USER CODE BEGIN TIM3_Init 0 */
+
+	/* USER CODE END TIM3_Init 0 */
+
+	TIM_Encoder_InitTypeDef sConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+
+	/* USER CODE BEGIN TIM3_Init 1 */
+
+	/* USER CODE END TIM3_Init 1 */
+	htim3.Instance = TIM3;
+	htim3.Init.Prescaler = 0;
+	htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim3.Init.Period = 65535;
+	htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
+	sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+	sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+	sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+	sConfig.IC1Filter = 10;
+	sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+	sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+	sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+	sConfig.IC2Filter = 0;
+	if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM3_Init 2 */
+
+	/* USER CODE END TIM3_Init 2 */
+
+}
+
+/**
+ * @brief TIM8 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM8_Init(void) {
+
+	/* USER CODE BEGIN TIM8_Init 0 */
+
+	/* USER CODE END TIM8_Init 0 */
+
+	TIM_ClockConfigTypeDef sClockSourceConfig = { 0 };
+	TIM_MasterConfigTypeDef sMasterConfig = { 0 };
+	TIM_OC_InitTypeDef sConfigOC = { 0 };
+	TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = { 0 };
+
+	/* USER CODE BEGIN TIM8_Init 1 */
+
+	/* USER CODE END TIM8_Init 1 */
+	htim8.Instance = TIM8;
+	htim8.Init.Prescaler = 0;
+	htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
+	htim8.Init.Period = 7199;
+	htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	htim8.Init.RepetitionCounter = 0;
+	htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+	if (HAL_TIM_Base_Init(&htim8) != HAL_OK) {
+		Error_Handler();
+	}
+	sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+	if (HAL_TIM_ConfigClockSource(&htim8, &sClockSourceConfig) != HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_TIM_PWM_Init(&htim8) != HAL_OK) {
+		Error_Handler();
+	}
+	sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+	sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+	if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	sConfigOC.OCMode = TIM_OCMODE_PWM1;
+	sConfigOC.Pulse = 0;
+	sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+	sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+	sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+	sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+	sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+	if (HAL_TIM_PWM_ConfigChannel(&htim8, &sConfigOC, TIM_CHANNEL_1)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	if (HAL_TIM_PWM_ConfigChannel(&htim8, &sConfigOC, TIM_CHANNEL_2)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+	sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+	sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+	sBreakDeadTimeConfig.DeadTime = 0;
+	sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+	sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+	sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+	if (HAL_TIMEx_ConfigBreakDeadTime(&htim8, &sBreakDeadTimeConfig)
+			!= HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN TIM8_Init 2 */
+
+	/* USER CODE END TIM8_Init 2 */
+
+}
+
+/**
+ * @brief USART3 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_USART3_UART_Init(void) {
+
+	/* USER CODE BEGIN USART3_Init 0 */
+
+	/* USER CODE END USART3_Init 0 */
+
+	/* USER CODE BEGIN USART3_Init 1 */
+
+	/* USER CODE END USART3_Init 1 */
+	huart3.Instance = USART3;
+	huart3.Init.BaudRate = 115200;
+	huart3.Init.WordLength = UART_WORDLENGTH_8B;
+	huart3.Init.StopBits = UART_STOPBITS_1;
+	huart3.Init.Parity = UART_PARITY_NONE;
+	huart3.Init.Mode = UART_MODE_TX_RX;
+	huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+	huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+	if (HAL_UART_Init(&huart3) != HAL_OK) {
+		Error_Handler();
+	}
+	/* USER CODE BEGIN USART3_Init 2 */
+
+	/* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+ * @brief GPIO Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_GPIO_Init(void) {
+	GPIO_InitTypeDef GPIO_InitStruct = { 0 };
+
+	/* GPIO Ports Clock Enable */
+	__HAL_RCC_GPIOE_CLK_ENABLE();
+	__HAL_RCC_GPIOA_CLK_ENABLE();
+	__HAL_RCC_GPIOC_CLK_ENABLE();
+	__HAL_RCC_GPIOB_CLK_ENABLE();
+
+	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(GPIOE,
+			OLED_SCLK_Pin | OLED_SDA_Pin | OLED_RST_Pin | OLED_DC_Pin | LED3_Pin,
+			GPIO_PIN_RESET);
+
+	/*Configure GPIO pin Output Level */
+	HAL_GPIO_WritePin(GPIOA, AIN2_Pin | AIN1_Pin | BIN1_Pin | BIN2_Pin,
+			GPIO_PIN_RESET);
+
+	/*Configure GPIO pins : OLED_SCLK_Pin OLED_SDA_Pin OLED_RST_Pin OLED_DC_Pin
+	 LED3_Pin */
+	GPIO_InitStruct.Pin = OLED_SCLK_Pin | OLED_SDA_Pin | OLED_RST_Pin
+			| OLED_DC_Pin | LED3_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+	/*Configure GPIO pins : AIN2_Pin AIN1_Pin BIN1_Pin BIN2_Pin */
+	GPIO_InitStruct.Pin = AIN2_Pin | AIN1_Pin | BIN1_Pin | BIN2_Pin;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+	HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+
+	uint32_t cmd = 0;
+	if (huart == &huart3) {
+		char c1 = aRxBuffer[0];
+		char c2 = aRxBuffer[1];
+		// char c3 = aRxBuffer[2];
+		char d[4];
+		memcpy(d, (void*) &aRxBuffer[2], 3);
+		d[3] = '\0';
+
+		data = (uint32_t) atoi(d);
+		if (c1 == 'n') {
+			newCmdReceived = 1;
+
+		}
+		directionCmd = c2;
+		// steeringCmd = c3;
+		uint8_t message1[20];
+
+		sprintf(message1, "cmd:%c,%d", directionCmd, data);
+		OLED_ShowString(10, 10, message1);
+
+		if (newCmdReceived == 1) {
+			// load direction Cmd and distance data into the queue using the cmd variable
+			// w = 1, a = 2, s = 3, d = 4
+			if (directionCmd == 'w')
+				cmd = MOVE_FORWARD;
+			else if (directionCmd == 'q')
+				cmd = MOVE_FORWARD_LEFT;
+			else if (directionCmd == 'e')
+				cmd = MOVE_FORWARD_RIGHT;
+			else if (directionCmd == 'x')
+				cmd = MOVE_BACKWARD;
+			else if (directionCmd == 'z')
+				cmd = MOVE_BACKWARD_LEFT;
+			else if (directionCmd == 'c')
+				cmd = MOVE_BACKWARD_RIGHT;
+			else if (directionCmd == 's')
+				cmd = CENTER_CALIBRATION;
+			else if (directionCmd == 'u') {
+				cmd = MOVE_INFINITELY;
+			} else
+				cmd = 0;
+			cmd = cmd * 1000 + data;
+
+			// enqueue the command
+			osStatus_t status = osMessageQueuePut(chassisCommandQueueHandle,
+					&cmd, 0, 0);
+
+			HAL_UART_Transmit(&huart3, (uint8_t*) "ACK", 3, 100);
+
+			// for debugging
+			// if (status == osOK) {
+			//sprintf(message1, "cmd: %d", cmd);
+			//OLED_ShowString(10, 40, message1);
+
+			/*} else if (status == osErrorTimeout) {
+			 sprintf(message1, "TIMEOUT");
+			 OLED_ShowString(10, 40, message1);
+			 } else if (status == osErrorResource) {
+			 sprintf(message1, "RESOURCE");
+			 OLED_ShowString(10, 40, message1);
+			 } else if (status == osErrorParameter) {
+			 sprintf(message1, "Param");
+			 OLED_ShowString(10, 40, message1);
+			 } else {
+			 sprintf(message1, "OTHER");
+			 OLED_ShowString(10, 40, message1);
+			 }
+			 */
+		}
+		HAL_UART_Receive_IT(&huart3, (uint8_t*) aRxBuffer, 5);
+	}
+}
+
+//////////////////// Movement Helper Function ////////////////////
+void setLeftPWM(uint16_t dutyCycle) {
+	__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, dutyCycle);
+}
+
+void setRightPWM(uint16_t dutyCycle) {
+	__HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, dutyCycle);
+}
+
+void motorStop() {
+	// ------- left motor
+	HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_RESET);
+	// ------- right motor
+	HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_RESET);
+}
+void moveMotor(int direction) // 0 is forward, 1 is backward
+{
+	// start the PWM
+	HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+	HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+
+	if (direction == 0) {
+		// ------- left motor
+		HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_SET);
+		// ------- right motor
+		HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_RESET);
+		HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_SET);
+		// drive the motor
+		setLeftPWM(3150);
+		setRightPWM(3000);
+	} else {
+		// ------- left motor
+		HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_SET);
+		HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_RESET);
+		// ------- right motor
+		HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_SET);
+		HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_RESET);
+		// drive the motor
+		setLeftPWM(3150);
+		setRightPWM(3000);
+	}
+
+}
+
+void setMotorForward() {
+	// set motor direction
+	// ------- left motor
+	HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_SET);
+	// ------- right motor
+	HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_SET);
+}
+void setMotorBackward() {
+	// set motor direction
+	// ------- left motor
+	HAL_GPIO_WritePin(GPIOA, BIN2_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOA, BIN1_Pin, GPIO_PIN_RESET);
+	// ------- right motor
+	HAL_GPIO_WritePin(GPIOA, AIN2_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(GPIOA, AIN1_Pin, GPIO_PIN_RESET);
+}
+void turnLeft() {
+	htim1.Instance->CCR4 = LEFT_POS_PWM;
+	osDelay(STEERING_BUFFER_TIME);
+}
+void turnRight() {
+	htim1.Instance->CCR4 = RIGHT_POS_PWM;
+	osDelay(STEERING_BUFFER_TIME);
+}
+void faceFront() {
+	htim1.Instance->CCR4 = CENTER_POS_PWM;
+	osDelay(STEERING_BUFFER_TIME);
+}
+
+void calibrate() {
+	htim1.Instance->CCR4 = RIGHT_POS_PWM;
+	osDelay(STEERING_BUFFER_TIME);
+}
+
+void robotTurn(float *targetAngle) {
+	*targetAngle = 4 * (*targetAngle);
+	angleNow = 0;
+	gyroZ = 0;
+	last_curTask_tick = HAL_GetTick();
+	do {
+		if (HAL_GetTick() - last_curTask_tick >= 10) { // sample gyro every 10ms
+			__Gyro_Read_Z(&hi2c1, readGyroZData, gyroZ);
+			angleNow += gyroZ / GRYO_SENSITIVITY_SCALE_FACTOR_2000DPS * 0.01;
+			if (abs(angleNow - *targetAngle) < 0.1)
+				break;
+			last_curTask_tick = HAL_GetTick();
+		}
+	} while (1);
+	*targetAngle = 0;
+	setLeftPWM(0);
+	setRightPWM(0);
+	calibrate();
+}
+
+// ENCODER HELPER FUNCTIONS
+
+uint32_t getEncoderDelta(uint32_t count1, uint32_t count2,
+		TIM_HandleTypeDef *htim) {
+	if (__HAL_TIM_IS_TIM_COUNTING_DOWN(htim)) {
+		if (count2 <= count1) {
+			return count1 - count2;
+		} else {
+			return (65535 - count2) + count1;
+		}
+	} else {
+		if (count2 >= count1) {
+			return count2 - count1;
+		} else {
+			return (65535 - count1) + count2;
+		}
+	}
+}
+
+void robotTurnPID(float *targetAngle, int direction) {
+	*targetAngle = 4 * (*targetAngle);
+	angleNow = 0;
+	gyroZ = 0;
+	last_curTask_tick = HAL_GetTick();
+	float kp = 0.1; // Proportional gain. You can tune this value for better performance.
+	float ki = 0.05;
+	float kd = 0.1;
+	uint16_t maxDutyCycle = 3000; // Maximum duty cycle value for your motors.
+	float error_sum = 0;
+	float last_error = 0;
+
+	do {
+		if (HAL_GetTick() - last_curTask_tick >= 10) { // sample gyro every 10ms
+			__Gyro_Read_Z(&hi2c1, readGyroZData, gyroZ);
+			angleNow += fabs(gyroZ)
+					/ GRYO_SENSITIVITY_SCALE_FACTOR_2000DPS * 0.01;
+			float error = fabs(*targetAngle) - fabs(angleNow);
+			error_sum += error;
+			float error_derivative = error - last_error;
+			float motorSpeed = kp * error + ki * error_sum
+					+ kd * error_derivative;
+
+			// Convert motorSpeed to dutyCycle and ensure it's within the allowed range
+			uint16_t dutyCycle = (uint16_t) (fabs(motorSpeed) * maxDutyCycle);
+			if (dutyCycle > maxDutyCycle)
+				dutyCycle = maxDutyCycle;
+
+			if (direction == 0) { // Turning left
+				setLeftPWM(0);
+				setRightPWM(dutyCycle);
+			} else if (direction == 1) { // Turning right
+				setLeftPWM(dutyCycle);
+				setRightPWM(0);
+			}
+
+			if (abs(error) < 0.1) {
+				break;
+			}
+			last_error = error;
+			last_curTask_tick = HAL_GetTick();
+		}
+	} while (1);
+
+	*targetAngle = 0;
+	setLeftPWM(0);
+	setRightPWM(0);
+	calibrate();
+}
+
+////////////////////////////////////////
+
+/* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+ * @brief  Function implementing the defaultTask thread.
+ * @param  argument: Not used
+ * @retval None
+ */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument) {
+	/* USER CODE BEGIN 5 */
+	/* Infinite loop */
+	for (;;) {
+		// Toggle LED just to see if the code is running
+		HAL_GPIO_TogglePin(LED3_GPIO_Port, LED3_Pin);
+		OLED_Refresh_Gram(); // Refresh Ram
+		osDelay(50);
+	}
+	/* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_chassisTask */
+/**
+ * @brief Function implementing the ChassisTask thread.
+ * @param argument: Not used
+ * @retval None
+ */
+/* USER CODE END Header_chassisTask */
+void chassisTask(void *argument) {
+	/* USER CODE BEGIN chassisTask */
+	uint32_t encoder_A_count1 = 0, encoder_A_count2 = 0, encoder_A_count_delta =
+			0, encoder_B_count1 = 0, encoder_B_count2 = 0,
+			encoder_B_count_delta = 0;
+
+	uint8_t message1[20];
+	uint32_t current_cmd = 0;
+
+	//Rpi transmit buffer
+	uint8_t RpiBuffer[20] = "COMPLE\r\n";
+
+	// toMove Flag
+	int toMove = 0;
+	// disconnect the motor first
+	//motorStop();
+	faceFront();
+
+	// set initial values for count and ticks for both encoders
+	encoder_A_count1 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim2);
+	encoder_B_count1 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim3);
+
+	/* Infinite loop */
+	for (;;) {
+		int8_t directionCmdBuffer;
+		int16_t distanceCmdBuffer;
+
+		if (!toMove) {
+			// decompose commands
+			osMessageQueueGet(chassisCommandQueueHandle, &current_cmd, 0, 200);
+			if (current_cmd != 0) {
+				cmdFinishFlag = 1;
+			}
+			sprintf(message1, "ACK: %d", current_cmd);
+
+			OLED_ShowString(10, 20, message1);
+
+			uint8_t directionCmd = current_cmd / 1000;
+			uint16_t distanceCmd = current_cmd % 1000;
+			directionCmdBuffer = directionCmd;
+			distanceCmdBuffer = distanceCmd;
+			sprintf(message1, "dis: %d", distanceCmdBuffer);
+			OLED_ShowString(10, 40, message1);
+
+			if (directionCmd == MOVE_INFINITELY) {
+				moveMotor(distanceCmd);
+			} else {
+				// set motor directions and top speed
+				if (directionCmd == MOVE_BACKWARD
+						|| directionCmd == MOVE_BACKWARD_LEFT
+						|| directionCmd == MOVE_BACKWARD_RIGHT) {
+					setMotorBackward();
+					max_out = 4000;
+
+				} else {
+					setMotorForward();
+					max_out = 4000;
+				}
+				// set servo direction
+				if (directionCmd == MOVE_FORWARD_LEFT
+						|| directionCmd == MOVE_BACKWARD_LEFT) {
+					turnLeft();
+				} else if (directionCmd == MOVE_FORWARD_RIGHT
+						|| directionCmd == MOVE_BACKWARD_RIGHT) {
+					turnRight();
+				} else if (directionCmd == CENTER_CALIBRATION) {
+					calibrate();
+				} else {
+					faceFront();
+				}
+
+				// setpoint calculation (PID steering involved)
+				if (directionCmd == MOVE_BACKWARD_LEFT
+						|| directionCmd == MOVE_FORWARD_LEFT) {
+					setpoint_right = (((double) distanceCmd / 360) * 2 * 3.142 // was 25.5 (dependent on turning radius)
+							* (16.5 + 16.5)) / DISTANCE_PER_ENCODER_PULSE;
+					setpoint_left = (((double) distanceCmd / 360) * 2 * 3.142
+							* (16.5)) / DISTANCE_PER_ENCODER_PULSE;
+				} else if (directionCmd == MOVE_FORWARD_RIGHT
+						|| directionCmd == MOVE_BACKWARD_RIGHT) {
+					setpoint_left = (((double) distanceCmd / 360) * 2 * 3.142
+							* (16.5 + 26.5)) / DISTANCE_PER_ENCODER_PULSE; // was 27.3
+					setpoint_right = (((double) distanceCmd / 360) * 2 * 3.142
+							* (26.5)) / DISTANCE_PER_ENCODER_PULSE;
+
+				} else {
+					setpoint_left = ((double) distanceCmd)
+							/ DISTANCE_PER_ENCODER_PULSE;
+					setpoint_right = setpoint_left;
+				}
+
+				// reset other variables
+				input_left = 0;
+				output_left = 0;
+				input_right = 0;
+				output_right = 0;
+
+				// reset encoder value
+				encoder_A_count1 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim2);
+				encoder_B_count1 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim3);
+
+				// set toMove flag
+				toMove = 1;
+			}
+		}
+
+		if (toMove) {
+
+			int left_complete = 0;
+			int right_complete = 0;
+			// get current encoder count and ticks
+			encoder_A_count2 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim2);
+			encoder_B_count2 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim3);
+
+			// calculate the encoder count
+			encoder_A_count_delta = getEncoderDelta(encoder_A_count1,
+					encoder_A_count2, &htim2);
+			encoder_B_count_delta = getEncoderDelta(encoder_B_count1,
+					encoder_B_count2, &htim3);
+
+			input_left += (double) encoder_A_count_delta;
+			input_right += (double) encoder_B_count_delta;
+
+			if (directionCmdBuffer == MOVE_BACKWARD
+					|| directionCmdBuffer == MOVE_FORWARD) {
+
+				// if setpoint too small, PID won't work, use open-loop
+				if (distanceCmdBuffer >= 10) {
+
+					output_right = PID_calc(&right_pid, input_right,
+							setpoint_right);
+					output_left = PID_calc(&left_pid, input_left,
+							setpoint_right);
+
+					/*output_left = 2200;
+					 output_right = 2000;*/
+				} else {
+					output_left = 1500;
+					output_right = 1500;
+				}
+			} else {
+
+				if (directionCmdBuffer == MOVE_FORWARD_LEFT) {
+					targetAngle = distanceCmdBuffer; // dont know why need to *4, probably different IMU model freq
+					setLeftPWM(1000); // was 1000, 2000
+					setRightPWM(2000);
+					robotTurnPID(&targetAngle, 0);
+					//robotTurn(&targetAngle);
+				} else if (directionCmdBuffer == MOVE_FORWARD_RIGHT) {
+					//targetAngle = -distanceCmdBuffer;
+					targetAngle = distanceCmdBuffer;
+					setLeftPWM(2000);
+					setRightPWM(1000);
+					robotTurnPID(&targetAngle, 1);
+					//robotTurn(&targetAngle);
+				} else if (directionCmdBuffer == MOVE_BACKWARD_LEFT) {
+					targetAngle = -distanceCmdBuffer;
+					setLeftPWM(1000);
+					setRightPWM(2000);
+					robotTurn(&targetAngle);
+				} else if (directionCmdBuffer == MOVE_BACKWARD_RIGHT) {
+					targetAngle = distanceCmdBuffer;
+					setLeftPWM(2000);
+					setRightPWM(1000);
+					robotTurn(&targetAngle);
+				}
+				left_complete = 1;
+				right_complete = 1;
+
+				// PID Controlled Turning
+				/*if (directionCmdBuffer == MOVE_BACKWARD_LEFT
+				 || directionCmdBuffer == MOVE_FORWARD_LEFT) {
+				 output_left = 1000;
+				 output_right = 3000;
+				 } else if (directionCmdBuffer == MOVE_FORWARD_RIGHT
+				 || directionCmdBuffer == MOVE_BACKWARD_RIGHT) {
+				 output_left = 3000;
+				 output_right = 1000;
+				 }*/
+				//output_left = PID_calc(&left_turn_pid, input_left,
+				//		setpoint_left);
+				//output_right = PID_calc(&right_turn_pid, input_right,
+				//		setpoint_right);
+			}
+
+			if (setpoint_left - input_left <= 40) {
+				input_left = 0;
+				output_left = 0;
+				setpoint_left = 0;
+				setLeftPWM(0);
+				left_complete = 1;
+			}
+
+			if (setpoint_right - input_right <= 40) {
+				input_right = 0;
+				output_right = 0;
+				setpoint_right = 0;
+				setRightPWM(0);
+				right_complete = 1;
+			}
+
+			if (left_complete && right_complete) {
+				toMove = 0;
+				current_cmd = 0;
+				if (cmdFinishFlag) {
+					//HAL_UART_Transmit(&huart3, RpiBuffer, sizeof(RpiBuffer),
+					//		10);
+					cmdFinishFlag = 0;
+				}
+			}
+
+			// drive the motor
+			if (!left_complete)
+				setLeftPWM(output_left);
+			if (!right_complete)
+				setRightPWM(output_right);
+
+		}
+
+		// restart the process
+		encoder_A_count1 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim2);
+		encoder_B_count1 = (uint32_t) __HAL_TIM_GET_COUNTER(&htim3);
+		osDelay(50);
+	}
+
+	/* USER CODE END chassisTask */
+}
+
+/**
+ * @brief  Period elapsed callback in non blocking mode
+ * @note   This function is called  when TIM7 interrupt took place, inside
+ * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+ * a global variable "uwTick" used as application time base.
+ * @param  htim : TIM handle
+ * @retval None
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+	/* USER CODE BEGIN Callback 0 */
+
+	/* USER CODE END Callback 0 */
+	if (htim->Instance == TIM7) {
+		HAL_IncTick();
+	}
+	/* USER CODE BEGIN Callback 1 */
+
+	/* USER CODE END Callback 1 */
+}
+
+/**
+ * @brief  This function is executed in case of error occurrence.
+ * @retval None
+ */
+void Error_Handler(void) {
+	/* USER CODE BEGIN Error_Handler_Debug */
+	/* User can add his own implementation to report the HAL error return state */
+	__disable_irq();
+	while (1) {
+	}
+	/* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+	/* User can add his own implementation to report the file name and line number,
+	   ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
