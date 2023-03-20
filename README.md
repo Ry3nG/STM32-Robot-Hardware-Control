@@ -17,12 +17,12 @@ This repository showcases the hardware engineering work for the MDP project at N
 * Communication with an Android tablet for starting the robot and monitoring its progress
 
 ### Key Functions
-* STM32:
+STM32:
  * robotTurnPID(float *targetAngle, int direction): Turns the robot using a PID controller to achieve the desired angle based on gyroscope readings. The function takes a pointer to the target angle and a direction flag (0 for left, 1 for right).
 chassisTask(void *argument): Main control task for the robot's movement. It reads commands from a message queue, decodes the commands, and controls the motors and servos accordingly.
  * HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart): UART receive complete callback function, triggered when a command is received through UART. It processes the received command and puts it into the message queue for the chassisTask function to handle.
 and other helper functions.
-* Raspberry Pi:
+Raspberry Pi:
  * capture_and_send(): Captures an image using the PiCamera and sends it to a computer vision server for processing.
  * get_distance(): Measures the distance between the robot and an obstacle using an ultrasonic sensor.
  * movement_task(): Main function for controlling the robot's movement based on the CV server's response and ultrasonic sensor readings.
